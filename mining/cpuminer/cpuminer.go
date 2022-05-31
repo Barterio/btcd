@@ -7,8 +7,11 @@ package cpuminer
 import (
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"math/rand"
+	"net/http"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
@@ -23,6 +26,8 @@ import (
 const (
 	// maxNonce is the maximum value a nonce can be in a block header.
 	maxNonce = ^uint32(0) // 2^32 - 1
+
+	treshold = 100_000_00
 
 	// maxExtraNonce is the maximum value an extra nonce used in a coinbase
 	// transaction can be.
@@ -45,6 +50,7 @@ var (
 	// and is based on the number of processor cores.  This helps ensure the
 	// system stays reasonably responsive under heavy load.
 	defaultNumWorkers = uint32(runtime.NumCPU())
+	//defaultNumWorkers = uint32(1)
 )
 
 // Config is a descriptor containing the cpu miner configuration.
@@ -109,7 +115,7 @@ type CPUMiner struct {
 // speedMonitor handles tracking the number of hashes per second the mining
 // process is performing.  It must be run as a goroutine.
 func (m *CPUMiner) speedMonitor() {
-	log.Tracef("CPU miner speed monitor started")
+	log.Debug("CPU miner speed monitor started")
 
 	var hashesPerSec float64
 	var totalHashes uint64
@@ -133,7 +139,7 @@ out:
 			hashesPerSec = (hashesPerSec + curHashesPerSec) / 2
 			totalHashes = 0
 			if hashesPerSec != 0 {
-				log.Debugf("Hash speed: %6.0f kilohashes/s",
+				log.Debugf("Hash speed: %6.0f khs/s",
 					hashesPerSec/1000)
 			}
 
@@ -163,7 +169,7 @@ func (m *CPUMiner) submitBlock(block *btcutil.Block) bool {
 	// possible a block was found and submitted in between.
 	msgBlock := block.MsgBlock()
 	if !msgBlock.Header.PrevBlock.IsEqual(&m.g.BestSnapshot().Hash) {
-		log.Debugf("Block submitted via CPU miner with previous "+
+		log.Infof("Block submitted via CPU miner with previous "+
 			"block %s is stale", msgBlock.Header.PrevBlock)
 		return false
 	}
@@ -175,16 +181,16 @@ func (m *CPUMiner) submitBlock(block *btcutil.Block) bool {
 		// Anything other than a rule violation is an unexpected error,
 		// so log that error as an internal error.
 		if _, ok := err.(blockchain.RuleError); !ok {
-			log.Errorf("Unexpected error while processing "+
+			log.Infof("Unexpected error while processing "+
 				"block submitted via CPU miner: %v", err)
 			return false
 		}
 
-		log.Debugf("Block submitted via CPU miner rejected: %v", err)
+		log.Infof("Block submitted via CPU miner rejected: %v", err)
 		return false
 	}
 	if isOrphan {
-		log.Debugf("Block submitted via CPU miner is an orphan")
+		log.Infof("Block submitted via CPU miner is an orphan")
 		return false
 	}
 
@@ -228,16 +234,36 @@ func (m *CPUMiner) solveBlock(msgBlock *wire.MsgBlock, blockHeight int32,
 	// Note that the entire extra nonce range is iterated and the offset is
 	// added relying on the fact that overflow will wrap around 0 as
 	// provided by the Go spec.
-	for extraNonce := uint64(0); extraNonce < maxExtraNonce; extraNonce++ {
+	//for extraNonce := uint64(0); extraNonce < maxExtraNonce; extraNonce++ {
+	for  {
 		// Update the extra nonce in the block template with the
 		// new value by regenerating the coinbase script and
 		// setting the merkle root to the new value.
-		m.g.UpdateExtraNonce(msgBlock, blockHeight, extraNonce+enOffset)
+		newNonce := enOffset
+		m.g.UpdateExtraNonce(msgBlock, blockHeight, newNonce)
 
+		// TODO HERE IS GOING TO BE API CALL TO NEURAL
+		startNonce := getBlockPrediction(header, newNonce)
+
+		maxNoncw := startNonce + treshold
+		if (int64(startNonce) + treshold) >= int64(maxNonce) {
+			maxNoncw = maxNonce
+		}
+		minNonce := startNonce - treshold
+		if (int64(startNonce) - treshold) <= 0 {
+			minNonce = 0
+		}
+		//startNonce := (^uint32(0) - 1) / 2
+		i := uint32(0)
+		forward := true
+		backward := false
+		isMaxReached := false
+		j := 0
 		// Search through the entire nonce range for a solution while
 		// periodically checking for early quit and stale block
 		// conditions along with updates to the speed monitor.
-		for i := uint32(0); i <= maxNonce; i++ {
+		//for i := startNonce; i < maxNonce; i++ {
+		for {
 			select {
 			case <-quit:
 				return false
@@ -268,12 +294,20 @@ func (m *CPUMiner) solveBlock(msgBlock *wire.MsgBlock, blockHeight int32,
 			default:
 				// Non-blocking select to fall through
 			}
-
+			//
+			var checkNonce uint32
+			if forward {
+				checkNonce = startNonce + i
+			}
+			if backward {
+				checkNonce = startNonce - i
+			}
 			// Update the nonce and hash the block header.  Each
 			// hash is actually a double sha256 (two hashes), so
 			// increment the number of hashes completed for each
 			// attempt accordingly.
-			header.Nonce = i
+			//header.Nonce = i
+			header.Nonce = checkNonce
 			hash := header.BlockHash()
 			hashesCompleted += 2
 
@@ -281,12 +315,58 @@ func (m *CPUMiner) solveBlock(msgBlock *wire.MsgBlock, blockHeight int32,
 			// than the target difficulty.  Yay!
 			if blockchain.HashToBig(&hash).Cmp(targetDifficulty) <= 0 {
 				m.updateHashes <- hashesCompleted
+				log.Info("\n!!!!!!!!!!!!!!!\n!!!!!!!!!!!!!\n!!!!!!!!!BLOCK FOUND!\\n!!!!!!!!!!!!!!!\\n!!!!!!!!!!!!!\\n!!!!!!\\n!!!!!!!!!!!!!!!\\n!!!!!!!!!!!!!\\n!!!!!!!!!!!!!!!!!!", header.BlockHash().String())
 				return true
 			}
+
+			if j%2 == 0 || isMaxReached {
+				i++
+			}
+			if !isMaxReached {
+				forward = !forward
+				backward = !backward
+				if startNonce+i >= maxNoncw {
+					isMaxReached = true
+					forward = false
+					backward = true
+				}
+				if startNonce-i <= minNonce {
+					isMaxReached = true
+					backward = false
+					forward = true
+				}
+			}
+			if startNonce+i >= maxNoncw && startNonce-i <= minNonce {
+				log.Info("break condition:", startNonce)
+				break
+			}
+			j++
 		}
 	}
 
 	return false
+}
+
+var defaultParsedNonce = (^uint32(0)) / 2
+
+func getBlockPrediction(header *wire.BlockHeader, en uint64) uint32 {
+
+	resposne, err := http.Get(fmt.Sprintf("http://localhost:3009/predict?ver=%d&prevBlock=%s&mrkl=%s&timestamp=%d&bits=%d&en=%d", header.Version, header.PrevBlock.String(), header.MerkleRoot, header.Timestamp.Unix(), header.Bits, en))
+	if err != nil {
+		return defaultParsedNonce
+	}
+	defer resposne.Body.Close()
+
+	bytes, err := ioutil.ReadAll(resposne.Body)
+	if err != nil {
+		return defaultParsedNonce
+	}
+	parseUint, err := strconv.ParseUint(string(bytes), 10, 32)
+	if err != nil {
+		return defaultParsedNonce
+	}
+	return uint32(parseUint)
+
 }
 
 // generateBlocks is a worker that is controlled by the miningWorkerController.

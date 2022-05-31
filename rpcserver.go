@@ -4034,7 +4034,7 @@ func createMarshalledReply(rpcVersion btcjson.RPCVersion, id interface{}, result
 		}
 	}
 
-	return btcjson.MarshalResponse(rpcVersion, id, result, jsonErr)
+	return btcjson.MarshalResponse(btcjson.RpcVersion1, id, result, jsonErr)
 }
 
 // processRequest determines the incoming request type (single or batched),
@@ -4093,7 +4093,7 @@ func (s *rpcServer) processRequest(request *btcjson.Request, isAdmin bool, close
 	}
 
 	// Marshal the response.
-	msg, err := createMarshalledReply(request.Jsonrpc, request.ID, result, jsonErr)
+	msg, err := createMarshalledReply(btcjson.RpcVersion2, request.ID, result, jsonErr)
 	if err != nil {
 		rpcsLog.Errorf("Failed to marshal reply: %v", err)
 		return nil
@@ -4279,7 +4279,7 @@ func (s *rpcServer) jsonRPCRead(w http.ResponseWriter, r *http.Request, isAdmin 
 							Message: fmt.Sprintf("Invalid request: %v",
 								err),
 						}
-						resp, err = btcjson.MarshalResponse("", nil, nil, jsonErr)
+						resp, err = btcjson.MarshalResponse(btcjson.RpcVersion2, nil, nil, jsonErr)
 						if err != nil {
 							rpcsLog.Errorf("Failed to create reply: %v", err)
 						}
